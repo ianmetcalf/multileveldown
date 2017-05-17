@@ -1,7 +1,9 @@
 var lpstream = require('length-prefixed-stream')
 var eos = require('end-of-stream')
 var duplexify = require('duplexify')
+var ltgt = require('ltgt')
 var messages = require('./messages')
+var hook = require('./hook')
 
 var DECODERS = [
   messages.Get,
@@ -15,6 +17,7 @@ module.exports = function (db, opts) {
   if (!opts) opts = {}
 
   var readonly = !!(opts.readonly)
+  var enableLive = (opts.live !== false)
   var decode = lpstream.decode()
   var encode = lpstream.encode()
   var stream = duplexify(decode, encode)
@@ -31,8 +34,10 @@ module.exports = function (db, opts) {
   function ready () {
     var down = db.db
     var iterators = []
+    var cleanupHook = enableLive && hook(db, pushtoiterators)
 
     eos(stream, function () {
+      if (cleanupHook) cleanupHook()
       while (iterators.length) {
         var next = iterators.shift()
         if (next) next.end()
@@ -78,10 +83,20 @@ module.exports = function (db, opts) {
       encode.write(buf)
     }
 
+    function iteratordata (data) {
+      var buf = new Buffer(messages.IteratorData.encodingLength(data) + 1)
+      buf[0] = 1
+      messages.IteratorData.encode(data, buf, 1)
+      encode.write(buf)
+    }
+
     function onput (req) {
       preput(req.key, req.value, function (err) {
         if (err) return callback(err)
         down.put(req.key, req.value, function (err) {
+          if (!err && enableLive) {
+            pushtoiterators({key: req.key, value: req.value})
+          }
           callback(req.id, err, null)
         })
       })
@@ -110,16 +125,26 @@ module.exports = function (db, opts) {
       prebatch(req.ops, function (err) {
         if (err) return callback(err)
         down.batch(req.ops, function (err) {
+          if (!err && enableLive) {
+            req.ops.forEach(pushtoiterators)
+          }
           callback(req.id, err)
         })
       })
     }
 
     function oniterator (req) {
+      if (req.options && req.options.live && !enableLive) {
+        return iteratordata({
+          id: req.id,
+          err: new Error('Database does not support live read streams')
+        })
+      }
+
       while (iterators.length < req.id) iterators.push(null)
 
       var prev = iterators[req.id]
-      if (!prev) prev = iterators[req.id] = new Iterator(down, req, encode)
+      if (!prev) prev = iterators[req.id] = new Iterator(down, req, iteratordata)
 
       if (!req.batch) {
         iterators[req.id] = null
@@ -129,10 +154,19 @@ module.exports = function (db, opts) {
         prev.next()
       }
     }
+
+    function pushtoiterators (op) {
+      if (op.type && op.type !== 'put') return
+      for (var i = 0; i < iterators.length; i += 1) {
+        if (iterators[i] && iterators[i].push) {
+          iterators[i].push(op)
+        }
+      }
+    }
   }
 }
 
-function Iterator (down, req, encode) {
+function Iterator (down, req, respond) {
   var self = this
 
   this.batch = req.batch || 0
@@ -145,7 +179,6 @@ function Iterator (down, req, encode) {
   }
 
   this._iterator = down.iterator(req.options)
-  this._encode = encode
   this._send = send
   this._nexting = false
   this._first = true
@@ -157,23 +190,39 @@ function Iterator (down, req, encode) {
     value: null
   }
 
+  if (req.options && req.options.live) {
+    this._buffer = []
+    this.push = function (op) {
+      if (self._buffer.length < 32 && ltgt.contains(req.options, op.key)) {
+        self._buffer.push(op)
+        self.next()
+      }
+    }
+  }
+
   function send (err, key, value) {
     self._nexting = false
+    if (!err && !key && !value && self._buffer) {
+      var op = self._buffer.shift()
+      if (!op) return
+      key = op.key
+      value = op.value
+    }
     self._data.error = err && err.message
     self._data.key = key
     self._data.value = value
     self.batch--
-    var buf = new Buffer(messages.IteratorData.encodingLength(self._data) + 1)
-    buf[0] = 1
-    messages.IteratorData.encode(self._data, buf, 1)
-    encode.write(buf)
+    respond(self._data)
     self.next()
   }
 }
 
 Iterator.prototype.next = function () {
   if (this._nexting || this._ended) return
-  if (!this._first && (!this.batch || this._data.error || (!this._data.key && !this._data.value))) return
+  if (!this._first) {
+    if (!this.batch || this._data.error) return
+    if (!this._data.key && !this._data.value && !this._buffer) return
+  }
   this._first = false
   this._nexting = true
   this._iterator.next(this._send)

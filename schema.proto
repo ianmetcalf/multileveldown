@@ -39,6 +39,7 @@ message Iterator {
     optional bytes lte = 6;
     optional sint32 limit = 7;
     optional bool reverse = 8;
+    optional bool live = 9;
   }
 }
 

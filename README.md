@@ -85,6 +85,19 @@ multileveldown will now make sure to retry your pending operations when you reco
 and your connection fails half way through reading that stream multileveldown makes sure to only retry the part of the
 stream you are missing. Please note that this might not guarantee leveldb snapshotting if you rely on that.
 
+## Live Read Streams
+
+Passing the `live: true` option to `createReadStream()` will return a stream that will continue to emit `data` as
+changes are made to the underlying server database. Any {lt,gt}{,e} options will be respected
+
+``` js
+var multileveldown = require('multileveldown')
+
+var db = multileveldown.client()
+
+db.createReadStream({live: true}).on('data', console.log)
+```
+
 ## API
 
 #### `multileveldown.server(db, [options])`
@@ -94,6 +107,7 @@ Returns a new duplex server stream that you should connect with a client. Option
 ``` js
 {
   readonly: true, // make the database be accessible as read only
+  live: false, // disallow live read streams
   preput: function (key, val, cb) {}, // called before puts
   predel: function (key, cb) {}, // called before dels
   prebatch: function (batch, cb) {} // called before batches
